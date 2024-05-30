@@ -1,0 +1,21 @@
+//# publish
+module 0x42.A {
+    struct T has drop {f: u64, g: u64}
+
+    public id(x: &mut Self.T): &mut Self.T {
+    label b0:        
+        return move(x);
+    }
+
+    public imprecise(t: &mut Self.T) {
+        let x: &mut Self.T;
+        let f: &mut u64;
+        let g: &mut u64;
+    label b0:
+        x = Self.id(move(t)); 
+        f = &mut copy(x).T::f;
+        g = &mut copy(x).T::g;
+        *copy(f) = 7;
+        return;
+    }
+}

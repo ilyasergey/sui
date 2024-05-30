@@ -136,6 +136,10 @@ impl<'a> CodeUnitVerifier<'a> {
         verifier_config: &VerifierConfig,
         meter: &mut (impl Meter + ?Sized),
     ) -> PartialVMResult<()> {
+        // [Ilya] Printing bytecode of the function before running the verifier
+        println!("Function: {:#?}", self.function_context.parameters());
+        println!("{:#?}", self.function_context.code().code);
+
         const REF_NEW_VERSION_REMOVE_ME: &'static str = "REF";
         let use_new_ref_safety = {
             let val = std::env::var(REF_NEW_VERSION_REMOVE_ME).map(|s| s.to_ascii_lowercase());

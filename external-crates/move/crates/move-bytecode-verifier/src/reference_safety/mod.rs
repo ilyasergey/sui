@@ -439,6 +439,8 @@ impl<'a> TransferFunctions for ReferenceSafetyAnalysis<'a> {
         last_index: CodeOffset,
         meter: &mut (impl Meter + ?Sized),
     ) -> PartialVMResult<()> {
+        // [Ilya] Printing bytecode
+        // println!("{:?}", bytecode);
         execute_inner(self, state, bytecode, index, meter)?;
         if index == last_index {
             safe_assert!(self.stack.is_empty());
