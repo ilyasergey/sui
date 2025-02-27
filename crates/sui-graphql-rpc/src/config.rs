@@ -10,7 +10,7 @@ use move_core_types::identifier::IdentStr;
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeSet, fmt::Display, time::Duration};
 use sui_default_config::DefaultConfig;
-use sui_json_rpc::name_service::NameServiceConfig;
+use sui_name_service::NameServiceConfig;
 use sui_types::base_types::{ObjectID, SuiAddress};
 
 pub(crate) const RPC_TIMEOUT_ERR_SLEEP_RETRY_PERIOD: Duration = Duration::from_millis(30_000);
@@ -118,10 +118,12 @@ pub struct Limits {
     pub max_type_argument_width: u32,
     /// Maximum size of a fully qualified type.
     pub max_type_nodes: u32,
-    /// Maximum deph of a move value.
+    /// Maximum depth of a move value.
     pub max_move_value_depth: u32,
     /// Maximum number of transaction ids that can be passed to a `TransactionBlockFilter`.
     pub max_transaction_ids: u32,
+    /// Maximum number of keys that can be passed to a `multiGetObjects` query.
+    pub max_multi_get_objects_keys: u32,
     /// Maximum number of candidates to scan when gathering a page of results.
     pub max_scan_limit: u32,
 }
@@ -343,6 +345,11 @@ impl ServiceConfig {
         self.limits.max_transaction_ids
     }
 
+    /// Maximum number of keys that can be passed to a `multiGetObjects` query.
+    async fn max_multi_get_objects_keys(&self) -> u32 {
+        self.limits.max_multi_get_objects_keys
+    }
+
     /// Maximum number of candidates to scan when gathering a page of results.
     async fn max_scan_limit(&self) -> u32 {
         self.limits.max_scan_limit
@@ -510,6 +517,7 @@ impl Default for Limits {
             // Filter-specific limits, such as the number of transaction ids that can be specified
             // for the `TransactionBlockFilter`.
             max_transaction_ids: 1000,
+            max_multi_get_objects_keys: 500,
             max_scan_limit: 100_000_000,
             // This value is set to be the size of the max transaction bytes allowed + base64
             // overhead (roughly 1/3 of the original string). This is rounded up.
@@ -594,6 +602,7 @@ mod tests {
                 max-type-nodes = 128
                 max-move-value-depth = 256
                 max-transaction-ids = 11
+                max-multi-get-objects-keys = 11
                 max-scan-limit = 50
             "#,
         )
@@ -616,6 +625,7 @@ mod tests {
                 max_type_nodes: 128,
                 max_move_value_depth: 256,
                 max_transaction_ids: 11,
+                max_multi_get_objects_keys: 11,
                 max_scan_limit: 50,
             },
             ..Default::default()
@@ -682,6 +692,7 @@ mod tests {
                 max-type-nodes = 128
                 max-move-value-depth = 256
                 max-transaction-ids = 42
+                max-multi-get-objects-keys = 42
                 max-scan-limit = 420
 
                 [experiments]
@@ -707,6 +718,7 @@ mod tests {
                 max_type_nodes: 128,
                 max_move_value_depth: 256,
                 max_transaction_ids: 42,
+                max_multi_get_objects_keys: 42,
                 max_scan_limit: 420,
             },
             disabled_features: BTreeSet::from([FunctionalGroup::Analytics]),

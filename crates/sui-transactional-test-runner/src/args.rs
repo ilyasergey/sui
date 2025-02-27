@@ -124,6 +124,8 @@ pub struct ProgrammableTransactionCommand {
     pub gas_payment: Option<FakeID>,
     #[clap(long = "dev-inspect")]
     pub dev_inspect: bool,
+    #[clap(long = "dry-run")]
+    pub dry_run: bool,
     #[clap(
         long = "inputs",
         value_parser = ParsedValue::<SuiExtraValueArgs>::parse,
@@ -189,6 +191,14 @@ pub struct RunGraphqlCommand {
 }
 
 #[derive(Debug, clap::Parser)]
+pub struct RunJsonRpcCommand {
+    #[clap(long = "show-headers")]
+    pub show_headers: bool,
+    #[clap(long, num_args(1..))]
+    pub cursors: Vec<String>,
+}
+
+#[derive(Debug, clap::Parser)]
 pub struct CreateCheckpointCommand {
     pub count: Option<u64>,
 }
@@ -225,6 +235,7 @@ pub enum SuiSubcommand<ExtraValueArgs: ParsableValue, ExtraRunArgs: Parser> {
     SetRandomState(SetRandomStateCommand),
     ViewCheckpoint,
     RunGraphql(RunGraphqlCommand),
+    RunJsonRpc(RunJsonRpcCommand),
     Bench(RunCommand<ExtraValueArgs>, ExtraRunArgs),
 }
 
@@ -270,6 +281,9 @@ impl<ExtraValueArgs: ParsableValue, ExtraRunArgs: Parser> clap::FromArgMatches
             Some(("run-graphql", matches)) => {
                 SuiSubcommand::RunGraphql(RunGraphqlCommand::from_arg_matches(matches)?)
             }
+            Some(("run-jsonrpc", matches)) => {
+                SuiSubcommand::RunJsonRpc(RunJsonRpcCommand::from_arg_matches(matches)?)
+            }
             Some(("bench", matches)) => SuiSubcommand::Bench(
                 RunCommand::from_arg_matches(matches)?,
                 ExtraRunArgs::from_arg_matches(matches)?,
@@ -307,6 +321,7 @@ impl<ExtraValueArgs: ParsableValue, ExtraRunArgs: Parser> clap::CommandFactory
             .subcommand(SetRandomStateCommand::command().name("set-random-state"))
             .subcommand(clap::Command::new("view-checkpoint"))
             .subcommand(RunGraphqlCommand::command().name("run-graphql"))
+            .subcommand(RunJsonRpcCommand::command().name("run-jsonrpc"))
             .subcommand(
                 RunCommand::<ExtraValueArgs>::augment_args(ExtraRunArgs::command()).name("bench"),
             )

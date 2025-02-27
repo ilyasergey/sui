@@ -104,6 +104,7 @@ pub mod apis;
 pub mod error;
 pub mod json_rpc_error;
 pub mod sui_client_config;
+pub mod verify_personal_message_signature;
 pub mod wallet_context;
 
 pub const SUI_COIN_TYPE: &str = "0x2::sui::SUI";
@@ -139,7 +140,7 @@ pub const SUI_MAINNET_URL: &str = "https://fullnode.mainnet.sui.io:443";
 /// ```
 pub struct SuiClientBuilder {
     request_timeout: Duration,
-    max_concurrent_requests: usize,
+    max_concurrent_requests: Option<usize>,
     ws_url: Option<String>,
     ws_ping_interval: Option<Duration>,
     basic_auth: Option<(String, String)>,
@@ -149,7 +150,7 @@ impl Default for SuiClientBuilder {
     fn default() -> Self {
         Self {
             request_timeout: Duration::from_secs(60),
-            max_concurrent_requests: 256,
+            max_concurrent_requests: None,
             ws_url: None,
             ws_ping_interval: None,
             basic_auth: None,
@@ -166,7 +167,7 @@ impl SuiClientBuilder {
 
     /// Set the max concurrent requests allowed
     pub fn max_concurrent_requests(mut self, max_concurrent_requests: usize) -> Self {
-        self.max_concurrent_requests = max_concurrent_requests;
+        self.max_concurrent_requests = Some(max_concurrent_requests);
         self
     }
 
@@ -231,13 +232,18 @@ impl SuiClientBuilder {
 
         let ws = if let Some(url) = self.ws_url {
             let mut builder = WsClientBuilder::default()
-                .max_request_body_size(2 << 30)
-                .max_concurrent_requests(self.max_concurrent_requests)
+                .max_request_size(2 << 30)
                 .set_headers(headers.clone())
                 .request_timeout(self.request_timeout);
 
             if let Some(duration) = self.ws_ping_interval {
-                builder = builder.ping_interval(duration)
+                builder = builder.enable_ws_ping(
+                    jsonrpsee::ws_client::PingConfig::new().ping_interval(duration),
+                );
+            }
+
+            if let Some(max_concurrent_requests) = self.max_concurrent_requests {
+                builder = builder.max_concurrent_requests(max_concurrent_requests);
             }
 
             builder.build(url).await.ok()
@@ -245,12 +251,16 @@ impl SuiClientBuilder {
             None
         };
 
-        let http = HttpClientBuilder::default()
-            .max_request_body_size(2 << 30)
-            .max_concurrent_requests(self.max_concurrent_requests)
+        let mut http_builder = HttpClientBuilder::default()
+            .max_request_size(2 << 30)
             .set_headers(headers.clone())
-            .request_timeout(self.request_timeout)
-            .build(http)?;
+            .request_timeout(self.request_timeout);
+
+        if let Some(max_concurrent_requests) = self.max_concurrent_requests {
+            http_builder = http_builder.max_concurrent_requests(max_concurrent_requests);
+        }
+
+        let http = http_builder.build(http)?;
 
         let info = Self::get_server_info(&http, &ws).await?;
 

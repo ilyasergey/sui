@@ -7,7 +7,7 @@ use crate::offchain_state::OffchainStateReader;
 use crate::simulator_persisted_store::PersistedStore;
 use crate::{args::*, programmable_transaction_test_parser::parser::ParsedCommand};
 use crate::{TransactionalAdapter, ValidatorWithFullnode};
-use anyhow::{anyhow, bail};
+use anyhow::{anyhow, bail, Context};
 use async_trait::async_trait;
 use bimap::btree::BiBTreeMap;
 use criterion::Criterion;
@@ -39,6 +39,8 @@ use move_transactional_test_runner::{
 use move_vm_runtime::session::SerializedReturnValues;
 use once_cell::sync::Lazy;
 use rand::{rngs::StdRng, Rng, SeedableRng};
+use serde::Deserialize;
+use serde_json::Value;
 use std::fmt::{self, Write};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -52,7 +54,10 @@ use sui_core::authority::AuthorityState;
 use sui_framework::DEFAULT_FRAMEWORK_PATH;
 use sui_graphql_rpc::test_infra::cluster::{RetentionConfig, SnapshotLagConfig};
 use sui_json_rpc_api::QUERY_MAX_RESULT_LIMIT;
-use sui_json_rpc_types::{DevInspectResults, SuiExecutionStatus, SuiTransactionBlockEffectsAPI};
+use sui_json_rpc_types::{
+    DevInspectResults, DryRunTransactionBlockResponse, SuiExecutionStatus,
+    SuiTransactionBlockEffects, SuiTransactionBlockEffectsAPI, SuiTransactionBlockEvents,
+};
 use sui_protocol_config::{Chain, ProtocolConfig};
 use sui_storage::{
     key_value_store::TransactionKeyValueStore, key_value_store_metrics::KeyValueStoreMetrics,
@@ -66,6 +71,7 @@ use sui_types::effects::{TransactionEffects, TransactionEffectsAPI, TransactionE
 use sui_types::messages_checkpoint::{
     CheckpointContents, CheckpointContentsDigest, CheckpointSequenceNumber, VerifiedCheckpoint,
 };
+use sui_types::messages_consensus::ConsensusDeterminedVersionAssignments;
 use sui_types::object::bounded_visitor::BoundedVisitor;
 use sui_types::storage::ReadStore;
 use sui_types::storage::{ObjectStore, RpcStateReader};
@@ -146,6 +152,8 @@ pub struct SuiTestAdapter {
     default_account: TestAccount,
     default_syntax: SyntaxChoice,
     object_enumeration: BiBTreeMap<ObjectID, FakeID>,
+    /// Mapping from task ID to a transaction digest, for use in named variable substitution.
+    digest_enumeration: BTreeMap<u64, TransactionDigest>,
     next_fake: (u64, u64),
     gas_price: u64,
     pub(crate) staged_modules: BTreeMap<Symbol, StagedPackage>,
@@ -407,6 +415,7 @@ impl<'a> MoveTestAdapter<'a> for SuiTestAdapter {
             default_account,
             default_syntax,
             object_enumeration: BiBTreeMap::new(),
+            digest_enumeration: BTreeMap::new(),
             next_fake: (0, 0),
             // TODO: make this configurable
             gas_price: default_gas_price.unwrap_or(DEFAULT_GAS_PRICE),
@@ -621,8 +630,6 @@ impl<'a> MoveTestAdapter<'a> for SuiTestAdapter {
                     .wait_for_checkpoint_catchup(highest_checkpoint, Duration::from_secs(60))
                     .await;
 
-                // wait_for_objects_snapshot_catchup(graphql_client, Duration::from_secs(180)).await;
-
                 if let Some(checkpoint_to_prune) = wait_for_checkpoint_pruned {
                     offchain_reader
                         .wait_for_pruned_checkpoint(checkpoint_to_prune, Duration::from_secs(60))
@@ -648,6 +655,53 @@ impl<'a> MoveTestAdapter<'a> for SuiTestAdapter {
                 output.push(format!("Response: {}", resp.response_body));
 
                 Ok(Some(output.join("\n")))
+            }
+            SuiSubcommand::RunJsonRpc(RunJsonRpcCommand {
+                show_headers,
+                cursors,
+            }) => {
+                let file = data.ok_or_else(|| anyhow::anyhow!("Missing JSON-RPC query"))?;
+                let contents = std::fs::read_to_string(file.path())?;
+
+                let offchain_reader = self
+                    .offchain_reader
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("Offchain reader not set"))?;
+
+                let highest_checkpoint = self.executor.get_latest_checkpoint_sequence_number()?;
+                offchain_reader
+                    .wait_for_checkpoint_catchup(highest_checkpoint, Duration::from_secs(60))
+                    .await;
+
+                let interpolated =
+                    self.interpolate_query(&contents, &cursors, highest_checkpoint)?;
+
+                #[derive(Deserialize)]
+                struct Query {
+                    method: String,
+                    params: Value,
+                }
+
+                let query: Query = serde_json::from_str(&interpolated)
+                    .context("Failed to parse JSON-RPC query")?;
+
+                let resp = offchain_reader
+                    .execute_jsonrpc(query.method, query.params)
+                    .await?;
+
+                let mut output = String::new();
+
+                if show_headers {
+                    write!(
+                        &mut output,
+                        "Headers: {:#?}\n\n",
+                        resp.http_headers.unwrap()
+                    )
+                    .unwrap();
+                }
+
+                write!(&mut output, "Response: {}", resp.response_body).unwrap();
+                Ok(Some(output))
             }
             SuiSubcommand::ViewCheckpoint => {
                 let latest_chk = self.executor.get_latest_checkpoint_sequence_number()?;
@@ -768,7 +822,7 @@ impl<'a> MoveTestAdapter<'a> for SuiTestAdapter {
                     0,
                     timestamp_ms,
                     ConsensusCommitDigest::default(),
-                    Vec::new(),
+                    ConsensusDeterminedVersionAssignments::empty_for_testing(),
                 );
                 let summary = self.execute_txn(transaction.into()).await?;
                 let output = self.object_summary_output(&summary, /* summarize */ false);
@@ -781,10 +835,15 @@ impl<'a> MoveTestAdapter<'a> for SuiTestAdapter {
                 gas_price,
                 gas_payment,
                 dev_inspect,
+                dry_run,
                 inputs,
             }) => {
                 if dev_inspect && self.is_simulator() {
                     bail!("Dev inspect is not supported on simulator mode");
+                }
+
+                if dry_run && dev_inspect {
+                    bail!("Cannot set both dev-inspect and dry-run");
                 }
 
                 let inputs = self.compiled_state().resolve_args(inputs)?;
@@ -822,7 +881,8 @@ impl<'a> MoveTestAdapter<'a> for SuiTestAdapter {
                         )
                     })
                     .collect::<anyhow::Result<Vec<Command>>>()?;
-                let summary = if !dev_inspect {
+
+                let summary = if !dev_inspect && !dry_run {
                     let gas_budget = gas_budget.unwrap_or(DEFAULT_GAS_BUDGET);
                     let gas_price = gas_price.unwrap_or(self.gas_price);
                     let transaction = self.sign_sponsor_txn(
@@ -841,6 +901,22 @@ impl<'a> MoveTestAdapter<'a> for SuiTestAdapter {
                         },
                     );
                     self.execute_txn(transaction).await?
+                } else if dry_run {
+                    let gas_budget = gas_budget.unwrap_or(DEFAULT_GAS_BUDGET);
+                    let gas_price = gas_price.unwrap_or(self.gas_price);
+                    let sender = self.get_sender(sender);
+                    let sponsor = sponsor.map_or(sender, |a| self.get_sender(Some(a)));
+
+                    let payment = self.get_payment(sponsor, gas_payment);
+
+                    let transaction = TransactionData::new_programmable(
+                        sender.address,
+                        vec![payment],
+                        ProgrammableTransaction { inputs, commands },
+                        gas_budget,
+                        gas_price,
+                    );
+                    self.dry_run(transaction).await?
                 } else {
                     assert!(
                         gas_budget.is_none(),
@@ -1198,7 +1274,7 @@ fn merge_output(left: Option<String>, right: Option<String>) -> Option<String> {
     }
 }
 
-impl<'a> SuiTestAdapter {
+impl SuiTestAdapter {
     pub fn with_offchain_reader(&mut self, offchain_reader: Box<dyn OffchainStateReader>) {
         self.offchain_reader = Some(offchain_reader);
     }
@@ -1215,13 +1291,8 @@ impl<'a> SuiTestAdapter {
         self.executor
     }
 
-    fn named_variables(
-        &self,
-        cursors: &[String],
-        highest_checkpoint: u64,
-    ) -> BTreeMap<String, String> {
+    fn named_variables(&self) -> BTreeMap<String, String> {
         let mut variables = BTreeMap::new();
-        let mut objects_mapping: BTreeMap<String, Vec<u8>> = BTreeMap::new();
 
         let named_addrs = self
             .compiled_state
@@ -1241,66 +1312,34 @@ impl<'a> SuiTestAdapter {
 
         for (oid, fid) in &self.object_enumeration {
             if let FakeID::Enumerated(x, y) = fid {
-                objects_mapping.insert(format!("obj_{x}_{y}"), oid.to_vec());
                 variables.insert(format!("obj_{x}_{y}"), oid.to_string());
                 variables.insert(format!("obj_{x}_{y}_opt"), oid.to_string());
             }
         }
 
-        for (idx, s) in cursors.iter().enumerate() {
-            // an object cursor may be either @{obj_x_y} or @{obj_x_y,n}
-            // if the former, then use highest_checkpoint
-            if s.starts_with("@{obj_") && s.ends_with('}') {
-                let end_of_key = s.find(',').unwrap_or(s.len() - 1);
-                let obj_lookup = s[2..end_of_key].to_string();
-
-                let obj_id = objects_mapping.get(&obj_lookup).unwrap_or_else(|| {
-                    panic!(
-                        "Unknown object lookup: {}\nAllowed variable mappings are {:#?}",
-                        obj_lookup, variables
-                    )
-                });
-
-                let checkpoint = if end_of_key == s.len() - 1 {
-                    highest_checkpoint
-                } else {
-                    s[end_of_key + 1..s.len() - 1].parse::<u64>().unwrap()
-                };
-
-                let bcsd = bcs::to_bytes(&(obj_id.clone(), checkpoint)).unwrap_or_default();
-                let base64d = Base64::encode(bcsd);
-
-                variables.insert(format!("cursor_{idx}"), base64d);
-            } else {
-                variables.insert(format!("cursor_{idx}"), Base64::encode(s));
-            }
+        for (tid, digest) in &self.digest_enumeration {
+            variables.insert(format!("digest_{tid}"), digest.to_string());
         }
 
         variables
     }
 
-    fn interpolate_query(
+    fn interpolate_contents(
         &self,
         contents: &str,
-        cursors: &[String],
-        highest_checkpoint: u64,
+        variables: &BTreeMap<String, String>,
     ) -> anyhow::Result<String> {
-        let variables = self.named_variables(cursors, highest_checkpoint);
-        let mut interpolated_query = contents.to_string();
+        let mut interpolated_contents = contents.to_string();
 
         let re = regex::Regex::new(r"@\{([^\}]+)\}").unwrap();
 
-        let mut unique_vars = std::collections::HashSet::new();
-
-        // Collect unique variables
-        for cap in re.captures_iter(contents) {
-            if let Some(var_name) = cap.get(1) {
-                unique_vars.insert(var_name.as_str());
-            }
-        }
+        let unique_vars = re
+            .captures_iter(contents)
+            .filter_map(|c| c.get(1).map(|m| m.as_str().to_string()))
+            .collect::<std::collections::HashSet<_>>();
 
         for var_name in unique_vars {
-            let Some(value) = variables.get(var_name) else {
+            let Some(value) = variables.get(&var_name) else {
                 return Err(anyhow!(
                     "Unknown variable: {}\nAllowed variable mappings are {:#?}",
                     var_name,
@@ -1309,10 +1348,61 @@ impl<'a> SuiTestAdapter {
             };
 
             let pattern = format!("@{{{}}}", var_name);
-            interpolated_query = interpolated_query.replace(&pattern, value);
+            interpolated_contents = interpolated_contents.replace(&pattern, value);
         }
 
-        Ok(interpolated_query)
+        Ok(interpolated_contents)
+    }
+
+    fn encode_cursor(&self, cursor: &str) -> anyhow::Result<String> {
+        // Cursor format is either bcs(object_id,n1,n2,...) or a json value,
+        // in which case we just return its base64 encoding.
+        let Some(args) = cursor
+            .strip_prefix("bcs(")
+            .and_then(|c| c.strip_suffix(")"))
+        else {
+            return Ok(Base64::encode(cursor));
+        };
+
+        let mut parts = args.split(",");
+
+        let id: ObjectID = parts
+            .next()
+            .context("bcs(...) cursors must have at least one argument")?
+            .trim()
+            .parse()?;
+
+        let mut bytes = bcs::to_bytes(&id.to_vec())?;
+        for part in parts {
+            let n: u64 = part.trim().parse()?;
+            bytes.extend(bcs::to_bytes(&n)?);
+        }
+
+        Ok(Base64::encode(bytes))
+    }
+
+    fn interpolate_query(
+        &self,
+        contents: &str,
+        cursors: &[String],
+        highest_checkpoint: u64,
+    ) -> anyhow::Result<String> {
+        // First collect all the variable mappings
+        let mut variables = self.named_variables();
+        variables.insert(
+            "highest_checkpoint".to_string(),
+            highest_checkpoint.to_string(),
+        );
+
+        // Then interpolate the cursors which may reference objects
+        for (idx, s) in cursors.iter().enumerate() {
+            let interpolated_cursor = self.interpolate_contents(s, &variables)?;
+            let encoded_cursor = self.encode_cursor(&interpolated_cursor)?;
+
+            // Add the encoded cursor to the variables map because they may get used in the query.
+            variables.insert(format!("cursor_{idx}"), encoded_cursor);
+        }
+        self.interpolate_contents(contents, &variables)
     }
 
     async fn upgrade_package(
@@ -1325,6 +1415,7 @@ impl<'a> SuiTestAdapter {
         gas_budget: Option<u64>,
         policy: u8,
         gas_price: u64,
+        // dry_run: bool,
     ) -> anyhow::Result<Option<String>> {
         let modules_bytes = modules
             .iter()
@@ -1418,6 +1509,19 @@ impl<'a> SuiTestAdapter {
         })
     }
 
+    fn get_payment(&self, sponsor: &TestAccount, payment: Option<FakeID>) -> ObjectRef {
+        let payment = if let Some(payment) = payment {
+            self.fake_to_real_object_id(payment)
+                .expect("Could not find specified payment object")
+        } else {
+            sponsor.gas
+        };
+
+        self.get_object(&payment, None)
+            .unwrap()
+            .compute_object_reference()
+    }
+
     fn sign_sponsor_txn(
         &self,
         sender: Option<String>,
@@ -1432,17 +1536,7 @@ impl<'a> SuiTestAdapter {
         let sender = self.get_sender(sender);
         let sponsor = sponsor.map_or(sender, |a| self.get_sender(Some(a)));
 
-        let payment = if let Some(payment) = payment {
-            self.fake_to_real_object_id(payment)
-                .expect("Could not find specified payment object")
-        } else {
-            sponsor.gas
-        };
-
-        let payment_ref = self
-            .get_object(&payment, None)
-            .unwrap()
-            .compute_object_reference();
+        let payment_ref = self.get_payment(sponsor, payment);
 
         let data = txn_data(sender.address, sponsor.address, payment_ref);
         if sender.address == sponsor.address {
@@ -1510,6 +1604,18 @@ impl<'a> SuiTestAdapter {
             .contains_shared_object();
         let (effects, error_opt) = self.executor.execute_txn(transaction).await?;
         let digest = effects.transaction_digest();
+
+        // Try to assign `digest_$task` to this transaction's digest -- panic if a transaction has
+        // already been set. Currently each task executes at most one transaction, and everything
+        // is fine. This panic triggering will be an early warning that we need to do something
+        // more sophisticated.
+        let task = self.next_fake.0;
+        if let Some(prev) = self.digest_enumeration.insert(task, *digest) {
+            panic!(
+                "Task {task} executed two transactions (expected at most one): {prev}, {digest}"
+            );
+        }
+
         let mut created_ids: Vec<_> = effects
             .created()
             .iter()
@@ -1596,6 +1702,19 @@ impl<'a> SuiTestAdapter {
         }
     }
 
+    async fn dry_run(&mut self, transaction: TransactionData) -> anyhow::Result<TxnSummary> {
+        let digest = transaction.digest();
+        let results = self
+            .executor
+            .dry_run_transaction_block(transaction, digest)
+            .await?;
+        let DryRunTransactionBlockResponse {
+            effects, events, ..
+        } = results;
+
+        self.tx_summary_from_effects(effects, events)
+    }
+
     async fn dev_inspect(
         &mut self,
         sender: SuiAddress,
@@ -1609,6 +1728,21 @@ impl<'a> SuiTestAdapter {
         let DevInspectResults {
             effects, events, ..
         } = results;
+
+        self.tx_summary_from_effects(effects, events)
+    }
+
+    fn tx_summary_from_effects(
+        &mut self,
+        effects: SuiTransactionBlockEffects,
+        events: SuiTransactionBlockEvents,
+    ) -> anyhow::Result<TxnSummary> {
+        if let SuiExecutionStatus::Failure { error } = effects.status() {
+            return Err(anyhow::anyhow!(self.stabilize_str(format!(
+                "Transaction Effects Status: {error}\nExecution Error: {error}",
+            ))));
+        }
+
         let mut created_ids: Vec<_> = effects.created().iter().map(|o| o.object_id()).collect();
         let mut mutated_ids: Vec<_> = effects.mutated().iter().map(|o| o.object_id()).collect();
         let mut unwrapped_ids: Vec<_> = effects.unwrapped().iter().map(|o| o.object_id()).collect();
@@ -1645,30 +1779,24 @@ impl<'a> SuiTestAdapter {
         unwrapped_then_deleted_ids.sort_by_key(|id| self.real_to_fake_object_id(id));
         wrapped_ids.sort_by_key(|id| self.real_to_fake_object_id(id));
 
-        match effects.status() {
-            SuiExecutionStatus::Success { .. } => {
-                let events = events
-                    .data
-                    .into_iter()
-                    .map(|sui_event| sui_event.into())
-                    .collect();
-                Ok(TxnSummary {
-                    events,
-                    gas_summary: gas_summary.clone(),
-                    created: created_ids,
-                    mutated: mutated_ids,
-                    unwrapped: unwrapped_ids,
-                    deleted: deleted_ids,
-                    unwrapped_then_deleted: unwrapped_then_deleted_ids,
-                    wrapped: wrapped_ids,
-                    // TODO: Properly propagate unchanged shared objects in dev_inspect.
-                    unchanged_shared: vec![],
-                })
-            }
-            SuiExecutionStatus::Failure { error } => Err(anyhow::anyhow!(self.stabilize_str(
-                format!("Transaction Effects Status: {error}\nExecution Error: {error}",)
-            ))),
-        }
+        let events = events
+            .data
+            .into_iter()
+            .map(|sui_event| sui_event.into())
+            .collect();
+
+        Ok(TxnSummary {
+            events,
+            gas_summary: gas_summary.clone(),
+            created: created_ids,
+            mutated: mutated_ids,
+            unwrapped: unwrapped_ids,
+            deleted: deleted_ids,
+            unwrapped_then_deleted: unwrapped_then_deleted_ids,
+            wrapped: wrapped_ids,
+            // TODO: Properly propagate unchanged shared objects in dev_inspect.
+            unchanged_shared: vec![],
+        })
     }
 
     fn get_object(&self, id: &ObjectID, version: Option<SequenceNumber>) -> anyhow::Result<Object> {

@@ -9,9 +9,9 @@ use sui_types::full_checkpoint_content::CheckpointData;
 use tokio::{sync::mpsc, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 
-use crate::{metrics::IndexerMetrics, watermarks::CommitterWatermark};
-
 use super::{processor::processor, CommitterConfig, Processor, PIPELINE_BUFFER};
+
+use crate::{metrics::IndexerMetrics, models::watermarks::CommitterWatermark};
 
 use self::committer::committer;
 
@@ -106,7 +106,7 @@ pub(crate) fn pipeline<H: Handler + Send + Sync + 'static>(
     let (processor_tx, committer_rx) = mpsc::channel(H::FANOUT + PIPELINE_BUFFER);
 
     let processor = processor(
-        handler,
+        Arc::new(handler),
         checkpoint_rx,
         processor_tx,
         metrics.clone(),

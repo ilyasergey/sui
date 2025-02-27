@@ -61,7 +61,6 @@ use crate::{
 
 use anyhow::{anyhow, Result};
 use crossbeam::channel::Sender;
-use derivative::*;
 use im::ordmap::OrdMap;
 use lsp_server::{Request, RequestId};
 use lsp_types::{
@@ -69,7 +68,6 @@ use lsp_types::{
     GotoDefinitionParams, Hover, HoverContents, HoverParams, Location, MarkupContent, MarkupKind,
     Position, Range, ReferenceParams, SymbolKind,
 };
-
 use sha2::{Digest, Sha256};
 use std::{
     cmp,
@@ -98,10 +96,7 @@ use move_compiler::{
     },
     linters::LintLevel,
     naming::ast::{DatatypeTypeParameter, StructFields, Type, TypeName_, Type_, VariantFields},
-    parser::{
-        ast::{self as P},
-        comments::CommentMap,
-    },
+    parser::ast::{self as P, DocComment},
     shared::{
         files::MappedFiles, unique_map::UniqueMap, Identifier, Name, NamedAddressMap,
         NamedAddressMaps,
@@ -164,8 +159,6 @@ pub struct CompiledPkgInfo {
     edition: Option<Edition>,
     /// Compiler info
     compiler_info: Option<CompilerInfo>,
-    /// Comments for both user code and the dependencies
-    all_comments: CommentMap,
 }
 
 /// Data used during symbols computation
@@ -407,16 +400,23 @@ pub struct MemberDef {
 }
 
 /// Definition of a local (or parameter)
-#[allow(clippy::non_canonical_partial_ord_impl)]
-#[derive(Derivative, Debug, Clone, Eq, PartialEq)]
-#[derivative(PartialOrd, Ord)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct LocalDef {
     /// Location of the definition
     pub def_loc: Loc,
     /// Type of definition
-    #[derivative(PartialOrd = "ignore")]
-    #[derivative(Ord = "ignore")]
     pub def_type: Type,
+}
+
+impl PartialOrd for LocalDef {
+    fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for LocalDef {
+    fn cmp(&self, other: &Self) -> cmp::Ordering {
+        self.def_loc.cmp(&other.def_loc)
+    }
 }
 
 /// Information about call sites relevant to the IDE
@@ -1787,37 +1787,72 @@ fn has_precompiled_deps(
     pkg_deps.contains_key(pkg_path)
 }
 
-fn is_parsed_pkg_modified(
-    pkg_def: &P::PackageDefinition,
-    files_to_compile: &BTreeSet<PathBuf>,
+/// Checks if a hash is included in the file hashes list.
+/// We only consider file hashes from files.
+fn hash_included_in_file_hashes(
+    hash: FileHash,
+    modified_files: &BTreeSet<PathBuf>,
     file_hashes: Arc<BTreeMap<PathBuf, FileHash>>,
 ) -> bool {
-    files_to_compile.iter().any(|fpath| {
-        file_hashes
-            .get(fpath)
-            .and_then(|fhash| match &pkg_def.def {
-                P::Definition::Module(mdef) => Some((mdef, fhash)),
-                _ => None,
-            })
-            .map_or(false, |(mdef, fhash)| mdef.loc.file_hash() == *fhash)
+    modified_files.iter().any(|fpath| {
+        file_hashes.get(fpath).map_or_else(
+            || {
+                debug_assert!(false);
+                false
+            },
+            |fhash| hash == *fhash,
+        )
     })
 }
 
-fn is_typed_mod_modified(
-    mdef: &ModuleDefinition,
-    files_to_compile: &BTreeSet<PathBuf>,
+/// Checks if a parsed module has been modified by comparing
+/// file hash in the module with the file hashes provided
+/// as an argument to see if module hash is included in the
+/// hashes provided. We only consider file hashes from modified
+/// files.
+fn is_parsed_mod_modified(
+    mdef: &P::ModuleDefinition,
+    modified_files: &BTreeSet<PathBuf>,
     file_hashes: Arc<BTreeMap<PathBuf, FileHash>>,
 ) -> bool {
-    files_to_compile.iter().any(|fpath| {
-        file_hashes
-            .get(fpath)
-            .map_or(false, |fhash| mdef.loc.file_hash() == *fhash)
-    })
+    !hash_included_in_file_hashes(mdef.loc.file_hash(), modified_files, file_hashes)
+}
+
+/// Checks if a typed module has been modified by comparing
+/// file hash in the module with the file hashes provided
+/// as an argument to see if module hash is included in the
+/// hashes provided. We only consider file hashes from modified
+/// files.
+fn is_typed_mod_modified(
+    mdef: &ModuleDefinition,
+    modified_files: &BTreeSet<PathBuf>,
+    file_hashes: Arc<BTreeMap<PathBuf, FileHash>>,
+) -> bool {
+    !hash_included_in_file_hashes(mdef.loc.file_hash(), modified_files, file_hashes)
+}
+
+/// Checks if a parsed package has been modified by comparing
+/// file hash in the package's modules with the file hashes provided
+/// as an argument to see if all module hashes are included
+/// in the hashes provided. We only consider file hashes from modified
+/// files.
+fn is_parsed_pkg_modified(
+    pkg_def: &P::PackageDefinition,
+    modified_files: &BTreeSet<PathBuf>,
+    file_hashes: Arc<BTreeMap<PathBuf, FileHash>>,
+) -> bool {
+    match &pkg_def.def {
+        P::Definition::Module(mdef) => is_parsed_mod_modified(mdef, modified_files, file_hashes),
+        P::Definition::Address(adef) => adef
+            .modules
+            .iter()
+            .any(|mdef| is_parsed_mod_modified(mdef, modified_files, file_hashes.clone())),
+    }
 }
 
 /// Merges a cached compiled program with newly computed compiled program
 /// In the newly computed program, only modified files are fully compiled
-/// and these files are mereged with the cached compiled program.
+/// and these files are merged with the cached compiled program.
 fn merge_user_programs(
     cached_info_opt: Option<AnalyzedPkgInfo>,
     parsed_program_new: P::Program,
@@ -1834,27 +1869,28 @@ fn merge_user_programs(
     // address maps might have changed but all would be computed in full during
     // incremental compilation as only function bodies are omitted
     parsed_program_cached.named_address_maps = parsed_program_new.named_address_maps;
-    // remove modules from user code that belong to modified files (use cached
-    // file hashes as we are comparing with hashes in cached modules)
+    // remove modules from user code that belong to modified files (use new
+    // file hashes - if cached module's hash is on the list of new file hashes, it means
+    // that nothing changed)
     parsed_program_cached.source_definitions.retain(|pkg_def| {
-        !is_parsed_pkg_modified(pkg_def, &files_to_compile, file_hashes_cached.clone())
+        !is_parsed_pkg_modified(pkg_def, &files_to_compile, file_hashes_new.clone())
     });
     let mut typed_modules_cached_filtered = UniqueMap::new();
     for (mident, mdef) in typed_modules_cached.into_iter() {
-        if !is_typed_mod_modified(&mdef, &files_to_compile, file_hashes_cached.clone()) {
+        if !is_typed_mod_modified(&mdef, &files_to_compile, file_hashes_new.clone()) {
             _ = typed_modules_cached_filtered.add(mident, mdef);
         }
     }
     typed_modules_cached = typed_modules_cached_filtered;
-    // add new modules from user code (use new file hashes as we are comparing with
-    // hashes in new modules)
+    // add new modules from user code (use cached file hashes - if new module's hash is on the list of
+    // cached file hashes, it means that nothing' changed)
     for pkg_def in parsed_program_new.source_definitions {
-        if is_parsed_pkg_modified(&pkg_def, &files_to_compile, file_hashes_new.clone()) {
+        if is_parsed_pkg_modified(&pkg_def, &files_to_compile, file_hashes_cached.clone()) {
             parsed_program_cached.source_definitions.push(pkg_def);
         }
     }
     for (mident, mdef) in typed_program_modules_new.into_iter() {
-        if is_typed_mod_modified(&mdef, &files_to_compile, file_hashes_new.clone()) {
+        if is_typed_mod_modified(&mdef, &files_to_compile, file_hashes_cached.clone()) {
             typed_modules_cached.remove(&mident); // in case new file has new definition of the module
             _ = typed_modules_cached.add(mident, mdef);
         }
@@ -2004,7 +2040,6 @@ pub fn get_compiled_pkg(
     };
 
     let mut edition = None;
-    let mut comments = None;
     let compiled_libs = cached_info_opt
         .clone()
         .map(|deps| deps.program_deps.clone());
@@ -2019,7 +2054,7 @@ pub fn get_compiled_pkg(
                 Some(files_to_compile.clone())
             })
             .run::<PASS_PARSER>()?;
-        let (comments_map, compiler) = match compilation_result {
+        let compiler = match compilation_result {
             Ok(v) => v,
             Err((_pass, diags)) => {
                 let failure = true;
@@ -2028,7 +2063,6 @@ pub fn get_compiled_pkg(
                 return Ok((files, vec![]));
             }
         };
-        comments = Some(comments_map);
         eprintln!("compiled to parsed AST");
         let (compiler, parsed_program) = compiler.into_ast();
         parsed_ast = Some(parsed_program.clone());
@@ -2100,10 +2134,6 @@ pub fn get_compiled_pkg(
             files_to_compile,
         )
     };
-    let mut all_comments = comments.unwrap();
-    if let Some(libs) = &compiled_libs {
-        all_comments.extend(libs.comments.clone());
-    }
     let compiled_pkg_info = CompiledPkgInfo {
         path: pkg_path.into(),
         manifest_hash,
@@ -2116,7 +2146,6 @@ pub fn get_compiled_pkg(
         mapped_files,
         edition,
         compiler_info,
-        all_comments,
     };
     Ok((Some(compiled_pkg_info), ide_diagnostics))
 }
@@ -2144,7 +2173,6 @@ pub fn compute_symbols_pre_process(
         &mut computation_data.def_info,
         &compiled_pkg_info.edition,
         cursor_context.as_mut(),
-        &compiled_pkg_info.all_comments,
     );
 
     if let Some(cached_deps) = compiled_pkg_info.cached_deps.clone() {
@@ -2169,7 +2197,6 @@ pub fn compute_symbols_pre_process(
                     &mut computation_data_deps.def_info,
                     &compiled_pkg_info.edition,
                     None, // Cursor can never be in a compiled library(?)
-                    &compiled_pkg_info.all_comments,
                 );
                 (
                     computation_data_deps.mod_outer_defs.clone(),
@@ -2519,7 +2546,7 @@ fn pre_process_parsed_pkg(
                     let indexed_fields = fields
                         .iter()
                         .enumerate()
-                        .map(|(i, (f, _))| (f.value(), i))
+                        .map(|(i, (_, f, _))| (f.value(), i))
                         .collect::<BTreeMap<_, _>>();
                     fields_order_info
                         .structs
@@ -2536,7 +2563,7 @@ fn pre_process_parsed_pkg(
                         let indexed_fields = fields
                             .iter()
                             .enumerate()
-                            .map(|(i, (f, _))| (f.value(), i))
+                            .map(|(i, (_, f, _))| (f.value(), i))
                             .collect::<BTreeMap<_, _>>();
                         fields_order_info
                             .variants
@@ -2564,7 +2591,6 @@ fn pre_process_typed_modules(
     def_info: &mut DefMap,
     edition: &Option<Edition>,
     mut cursor_context: Option<&mut CursorContext>,
-    all_comments: &CommentMap,
 ) {
     for (pos, module_ident, module_def) in typed_modules {
         // If the cursor is in this module, mark that down.
@@ -2585,7 +2611,6 @@ fn pre_process_typed_modules(
             references,
             def_info,
             edition,
-            all_comments,
         );
         mod_outer_defs.insert(mod_ident_str.clone(), defs);
         mod_use_defs.insert(mod_ident_str, symbols);
@@ -2729,38 +2754,29 @@ pub fn empty_symbols() -> Symbols {
     }
 }
 
-/// Get optional doc comment string at a given location.
-fn get_doc_string(all_comments: &CommentMap, loc: Loc) -> Option<String> {
-    all_comments
-        .get(&loc.file_hash())
-        .and_then(|m| m.get(&loc.start()))
-        .cloned()
-}
-
 fn field_defs_and_types(
     datatype_name: Symbol,
-    fields: &E::Fields<Type>,
+    fields: &E::Fields<(DocComment, Type)>,
     fields_order_opt: Option<&BTreeMap<Symbol, usize>>,
     mod_ident: &ModuleIdent,
     def_info: &mut DefMap,
-    all_comments: &CommentMap,
 ) -> (Vec<FieldDef>, Vec<Type>) {
     let mut field_defs = vec![];
     let mut field_types = vec![];
     let mut ordered_fields = fields
         .iter()
-        .map(|(floc, fname, (_, ftype))| (floc, fname, ftype))
+        .map(|(floc, fname, (_, (fdoc, ftype)))| (floc, fdoc, fname, ftype))
         .collect::<Vec<_>>();
     // sort fields by order if available for correct auto-completion
     if let Some(fields_order) = fields_order_opt {
-        ordered_fields.sort_by_key(|(_, fname, _)| fields_order.get(fname).copied());
+        ordered_fields.sort_by_key(|(_, _, fname, _)| fields_order.get(fname).copied());
     }
-    for (floc, fname, ftype) in ordered_fields {
+    for (floc, fdoc, fname, ftype) in ordered_fields {
         field_defs.push(FieldDef {
             name: *fname,
             loc: floc,
         });
-        let doc_string = get_doc_string(all_comments, floc);
+        let doc_string = fdoc.comment().map(|d| d.value.to_owned());
         def_info.insert(
             floc,
             DefInfo::Field(
@@ -2811,7 +2827,6 @@ fn get_mod_outer_defs(
     references: &mut References,
     def_info: &mut DefMap,
     edition: &Option<Edition>,
-    all_comments: &CommentMap,
 ) -> (ModuleDefs, UseDefMap) {
     let mut structs = BTreeMap::new();
     let mut enums = BTreeMap::new();
@@ -2830,14 +2845,8 @@ fn get_mod_outer_defs(
                 .structs
                 .get(&mod_ident_str)
                 .and_then(|s| s.get(name));
-            (field_defs, field_types) = field_defs_and_types(
-                *name,
-                fields,
-                fields_order_opt,
-                mod_ident,
-                def_info,
-                all_comments,
-            );
+            (field_defs, field_types) =
+                field_defs_and_types(*name, fields, fields_order_opt, mod_ident, def_info);
         };
 
         // process the struct itself
@@ -2861,7 +2870,7 @@ fn get_mod_outer_defs(
         } else {
             Visibility::Internal
         };
-        let doc_string = get_doc_string(all_comments, def.loc);
+        let doc_string = def.doc.comment().map(|d| d.value.to_owned());
         def_info.insert(
             name_loc,
             DefInfo::Struct(
@@ -2889,14 +2898,8 @@ fn get_mod_outer_defs(
                         .get(&mod_ident_str)
                         .and_then(|v| v.get(name))
                         .and_then(|v| v.get(vname));
-                    let (defs, types) = field_defs_and_types(
-                        *name,
-                        fields,
-                        fields_order_opt,
-                        mod_ident,
-                        def_info,
-                        all_comments,
-                    );
+                    let (defs, types) =
+                        field_defs_and_types(*name, fields, fields_order_opt, mod_ident, def_info);
                     (defs, types, *pos_fields)
                 }
                 VariantFields::Empty => (vec![], vec![], false),
@@ -2909,7 +2912,7 @@ fn get_mod_outer_defs(
             });
             variants_info.insert(*vname, (vname_loc, field_defs, positional));
 
-            let vdoc_string = get_doc_string(all_comments, def.loc);
+            let vdoc_string = def.doc.comment().map(|d| d.value.to_owned());
             def_info.insert(
                 vname_loc,
                 DefInfo::Variant(
@@ -2931,7 +2934,7 @@ fn get_mod_outer_defs(
                 info: MemberDefInfo::Enum { variants_info },
             },
         );
-        let enum_doc_string = get_doc_string(all_comments, def.loc);
+        let enum_doc_string = def.doc.comment().map(|d| d.value.to_owned());
         def_info.insert(
             name_loc,
             DefInfo::Enum(
@@ -2954,7 +2957,7 @@ fn get_mod_outer_defs(
                 info: MemberDefInfo::Const,
             },
         );
-        let doc_string = get_doc_string(all_comments, c.loc);
+        let doc_string = c.doc.comment().map(|d| d.value.to_owned());
         def_info.insert(
             name_loc,
             DefInfo::Const(
@@ -2978,7 +2981,7 @@ fn get_mod_outer_defs(
         } else {
             FunType::Regular
         };
-        let doc_string = get_doc_string(all_comments, fun.loc);
+        let doc_string = fun.doc.comment().map(|d| d.value.to_owned());
         let fun_info = DefInfo::Function(
             mod_ident.value,
             fun.visibility,
@@ -3022,7 +3025,7 @@ fn get_mod_outer_defs(
     let mut use_def_map = UseDefMap::new();
 
     let ident = mod_ident.value;
-    let doc_string = get_doc_string(all_comments, mod_def.loc);
+    let doc_string = mod_def.doc.comment().map(|d| d.value.to_owned());
     let mod_defs = ModuleDefs {
         fhash,
         ident,

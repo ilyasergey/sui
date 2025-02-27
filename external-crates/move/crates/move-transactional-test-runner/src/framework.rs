@@ -16,7 +16,7 @@ use move_bytecode_source_map::{mapping::SourceMapping, source_map::SourceMap};
 use move_command_line_common::{
     env::read_bool_env_var,
     files::{MOVE_EXTENSION, MOVE_IR_EXTENSION},
-    testing::{add_update_baseline_fix, format_diff, read_env_update_baseline, EXP_EXT},
+    insta_assert,
 };
 use move_compiler::{
     compiled_unit::AnnotatedCompiledUnit,
@@ -658,7 +658,7 @@ pub fn compile_source_units(
     // purpose and generating warnings for all of them does not make much sense (and there would be
     // a lot of them!) so let's suppress them function warnings, so let's suppress these
     let warning_filter = WarningFiltersBuilder::unused_warnings_filter_for_test();
-    let (mut files, comments_and_compiler_res) = move_compiler::Compiler::from_files(
+    let (mut files, compiler_res) = move_compiler::Compiler::from_files(
         None,
         vec![file_name.as_ref().to_str().unwrap().to_owned()],
         state.source_files().cloned().collect::<Vec<_>>(),
@@ -673,8 +673,7 @@ pub fn compile_source_units(
         ..PackageConfig::default()
     })
     .run::<PASS_COMPILATION>()?;
-    let units_or_diags = comments_and_compiler_res
-        .map(|(_comments, move_compiler)| move_compiler.into_compiled_units());
+    let units_or_diags = compiler_res.map(|move_compiler| move_compiler.into_compiled_units());
 
     match units_or_diags {
         Err((_pass, diags)) => {
@@ -807,7 +806,10 @@ where
         handle_known_task(&mut output, &mut adapter, task).await;
     }
 
-    handle_expected_output(path, output)?;
+    insta_assert! {
+        input_path: path,
+        contents: output,
+    }
     Ok(())
 }
 
@@ -868,32 +870,4 @@ async fn handle_known_task<'a, Adapter: MoveTestAdapter<'a>>(
         "\ntask {task_number}, {line_number}:\n{task_text}\n{result_string}"
     )
     .unwrap();
-}
-
-fn handle_expected_output(test_path: &Path, output: impl AsRef<str>) -> Result<()> {
-    let output = output.as_ref();
-    assert!(!output.is_empty());
-    let exp_path = test_path.with_extension(EXP_EXT);
-
-    if read_env_update_baseline() {
-        std::fs::write(exp_path, output).unwrap();
-        return Ok(());
-    }
-
-    if !exp_path.exists() {
-        std::fs::write(&exp_path, "").unwrap();
-    }
-    let expected_output = std::fs::read_to_string(&exp_path)
-        .unwrap()
-        .replace("\r\n", "\n")
-        .replace('\r', "\n");
-    if output != expected_output {
-        let msg = format!(
-            "Expected errors differ from actual errors:\n{}",
-            format_diff(expected_output, output),
-        );
-        anyhow::bail!(add_update_baseline_fix(msg))
-    } else {
-        Ok(())
-    }
 }

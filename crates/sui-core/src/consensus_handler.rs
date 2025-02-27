@@ -12,21 +12,25 @@ use arc_swap::ArcSwap;
 use consensus_config::Committee as ConsensusCommittee;
 use consensus_core::{CommitConsumerMonitor, TransactionIndex, VerifiedBlock};
 use lru::LruCache;
+use mysten_common::debug_fatal;
 use mysten_metrics::{
     monitored_future,
     monitored_mpsc::{self, UnboundedReceiver},
     monitored_scope, spawn_monitored_task,
 };
 use serde::{Deserialize, Serialize};
-use sui_macros::{fail_point_async, fail_point_if};
+use sui_macros::{fail_point, fail_point_if};
 use sui_protocol_config::ProtocolConfig;
 use sui_types::{
     authenticator_state::ActiveJwk,
-    base_types::{AuthorityName, EpochId, ObjectID, SequenceNumber, TransactionDigest},
+    base_types::{
+        AuthorityName, ConsensusObjectSequenceKey, EpochId, SequenceNumber, TransactionDigest,
+    },
     digests::ConsensusCommitDigest,
     executable_transaction::{TrustedExecutableTransaction, VerifiedExecutableTransaction},
     messages_consensus::{
-        AuthorityIndex, ConsensusTransaction, ConsensusTransactionKey, ConsensusTransactionKind,
+        AuthorityIndex, ConsensusDeterminedVersionAssignments, ConsensusTransaction,
+        ConsensusTransactionKey, ConsensusTransactionKind, ExecutionTimeObservation,
     },
     sui_system_state::epoch_start_sui_system_state::EpochStartSystemStateTrait,
     transaction::{SenderSignedData, VerifiedTransaction},
@@ -47,7 +51,7 @@ use crate::{
     checkpoints::{CheckpointService, CheckpointServiceNotify},
     consensus_throughput_calculator::ConsensusThroughputCalculator,
     consensus_types::consensus_output_api::{parse_block_transactions, ConsensusCommitAPI},
-    execution_cache::ObjectCacheRead,
+    execution_cache::{ObjectCacheRead, TransactionCacheRead},
     scoring_decision::update_low_scoring_authorities,
     transaction_manager::TransactionManager,
 };
@@ -108,6 +112,7 @@ impl ConsensusHandlerInitializer {
             self.checkpoint_service.clone(),
             self.state.transaction_manager().clone(),
             self.state.get_object_cache_reader().clone(),
+            self.state.get_transaction_cache_reader().clone(),
             self.low_scoring_authorities.clone(),
             consensus_committee,
             self.state.metrics.clone(),
@@ -136,6 +141,8 @@ pub struct ConsensusHandler<C> {
     checkpoint_service: Arc<C>,
     /// cache reader is needed when determining the next version to assign for shared objects.
     cache_reader: Arc<dyn ObjectCacheRead>,
+    /// used to read randomness transactions during crash recovery
+    tx_reader: Arc<dyn TransactionCacheRead>,
     /// Reputation scores used by consensus adapter that we update, forwarded from consensus
     low_scoring_authorities: Arc<ArcSwap<HashMap<AuthorityName, u64>>>,
     /// The consensus committee used to do stake computations for deciding set of low scoring authorities
@@ -161,6 +168,7 @@ impl<C> ConsensusHandler<C> {
         checkpoint_service: Arc<C>,
         transaction_manager: Arc<TransactionManager>,
         cache_reader: Arc<dyn ObjectCacheRead>,
+        tx_reader: Arc<dyn TransactionCacheRead>,
         low_scoring_authorities: Arc<ArcSwap<HashMap<AuthorityName, u64>>>,
         committee: ConsensusCommittee,
         metrics: Arc<AuthorityMetrics>,
@@ -182,6 +190,7 @@ impl<C> ConsensusHandler<C> {
             last_consensus_stats,
             checkpoint_service,
             cache_reader,
+            tx_reader,
             low_scoring_authorities,
             committee,
             metrics,
@@ -350,7 +359,9 @@ impl<C: CheckpointServiceNotify + Send + Sync> ConsensusHandler<C> {
                         &parsed.transaction.kind
                     {
                         // These are deprecated and we should never see them. Log an error and eat the tx if one appears.
-                        error!("BUG: saw deprecated RandomnessStateUpdate tx for commit round {round:?}, randomness round {randomness_round:?}")
+                        debug_fatal!(
+                            "BUG: saw deprecated RandomnessStateUpdate tx for commit round {round:?}, randomness round {randomness_round:?}"
+                        );
                     } else {
                         let transaction =
                             SequencedConsensusTransactionKind::External(parsed.transaction);
@@ -430,6 +441,7 @@ impl<C: CheckpointServiceNotify + Send + Sync> ConsensusHandler<C> {
                 &self.last_consensus_stats,
                 &self.checkpoint_service,
                 self.cache_reader.as_ref(),
+                self.tx_reader.as_ref(),
                 &ConsensusCommitInfo::new(self.epoch_store.protocol_config(), &consensus_commit),
                 &self.metrics,
             )
@@ -442,12 +454,12 @@ impl<C: CheckpointServiceNotify + Send + Sync> ConsensusHandler<C> {
 
         fail_point_if!("correlated-crash-after-consensus-commit-boundary", || {
             let key = [commit_sub_dag_index, self.epoch_store.epoch()];
-            if sui_simulator::random::deterministic_probability(&key, 0.01) {
+            if sui_simulator::random::deterministic_probability_once(&key, 0.01) {
                 sui_simulator::task::kill_current_node(None);
             }
         });
 
-        fail_point_async!("crash"); // for tests that produce random crashes
+        fail_point!("crash"); // for tests that produce random crashes
 
         self.transaction_manager_sender
             .send(executable_transactions);
@@ -581,6 +593,7 @@ pub(crate) fn classify(transaction: &ConsensusTransaction) -> &'static str {
                 "owned_user_transaction"
             }
         }
+        ConsensusTransactionKind::ExecutionTimeObservation(_) => "execution_time_observation",
     }
 }
 
@@ -718,6 +731,18 @@ impl SequencedConsensusTransaction {
         }
     }
 
+    pub fn try_take_execution_time_observation(&mut self) -> Option<ExecutionTimeObservation> {
+        if let SequencedConsensusTransactionKind::External(ConsensusTransaction {
+            kind: ConsensusTransactionKind::ExecutionTimeObservation(observation),
+            ..
+        }) = &mut self.transaction
+        {
+            Some(std::mem::take(observation))
+        } else {
+            None
+        }
+    }
+
     pub fn is_system(&self) -> bool {
         matches!(
             self.transaction,
@@ -842,14 +867,14 @@ impl ConsensusCommitInfo {
     fn consensus_commit_prologue_v3_transaction(
         &self,
         epoch: u64,
-        cancelled_txn_version_assignment: Vec<(TransactionDigest, Vec<(ObjectID, SequenceNumber)>)>,
+        consensus_determined_version_assignments: ConsensusDeterminedVersionAssignments,
     ) -> VerifiedExecutableTransaction {
         let transaction = VerifiedTransaction::new_consensus_commit_prologue_v3(
             epoch,
             self.round,
             self.timestamp,
             self.consensus_commit_digest,
-            cancelled_txn_version_assignment,
+            consensus_determined_version_assignments,
         );
         VerifiedExecutableTransaction::new_system(transaction, epoch)
     }
@@ -858,10 +883,33 @@ impl ConsensusCommitInfo {
         &self,
         epoch: u64,
         protocol_config: &ProtocolConfig,
-        cancelled_txn_version_assignment: Vec<(TransactionDigest, Vec<(ObjectID, SequenceNumber)>)>,
+        cancelled_txn_version_assignment: Vec<(
+            TransactionDigest,
+            Vec<(ConsensusObjectSequenceKey, SequenceNumber)>,
+        )>,
     ) -> VerifiedExecutableTransaction {
-        if protocol_config.record_consensus_determined_version_assignments_in_prologue() {
-            self.consensus_commit_prologue_v3_transaction(epoch, cancelled_txn_version_assignment)
+        if protocol_config.record_consensus_determined_version_assignments_in_prologue_v2() {
+            self.consensus_commit_prologue_v3_transaction(
+                epoch,
+                ConsensusDeterminedVersionAssignments::CancelledTransactionsV2(
+                    cancelled_txn_version_assignment,
+                ),
+            )
+        } else if protocol_config.record_consensus_determined_version_assignments_in_prologue() {
+            self.consensus_commit_prologue_v3_transaction(
+                epoch,
+                ConsensusDeterminedVersionAssignments::CancelledTransactions(
+                    cancelled_txn_version_assignment
+                        .into_iter()
+                        .map(|(tx_digest, versions)| {
+                            (
+                                tx_digest,
+                                versions.into_iter().map(|(id, v)| (id.0, v)).collect(),
+                            )
+                        })
+                        .collect(),
+                ),
+            )
         } else if protocol_config.include_consensus_digest_in_prologue() {
             self.consensus_commit_prologue_v2_transaction(epoch)
         } else {
@@ -993,7 +1041,7 @@ mod tests {
     use prometheus::Registry;
     use sui_protocol_config::ConsensusTransactionOrdering;
     use sui_types::{
-        base_types::{random_object_ref, AuthorityName, SuiAddress},
+        base_types::{random_object_ref, AuthorityName, ObjectID, SuiAddress},
         committee::Committee,
         crypto::deterministic_random_account_key,
         messages_consensus::{
@@ -1065,6 +1113,7 @@ mod tests {
             Arc::new(CheckpointServiceNoop {}),
             state.transaction_manager().clone(),
             state.get_object_cache_reader().clone(),
+            state.get_transaction_cache_reader().clone(),
             Arc::new(ArcSwap::default()),
             consensus_committee.clone(),
             metrics,

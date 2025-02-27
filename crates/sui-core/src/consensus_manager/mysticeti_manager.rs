@@ -167,7 +167,7 @@ impl ConsensusManagerTrait for MysticetiManager {
             *boot_counter += 1;
         } else {
             info!(
-                "Node has not participated in previous run. Boot counter will not increment {}",
+                "Node has not participated in previous epoch consensus. Boot counter ({}) will not increment.",
                 *boot_counter
             );
         }
@@ -215,7 +215,9 @@ impl ConsensusManagerTrait for MysticetiManager {
         *consensus_handler = Some(handler);
 
         // Wait until all locally available commits have been processed
+        info!("replaying commits at startup");
         registered_authority.0.replay_complete().await;
+        info!("Startup commit replay complete");
     }
 
     async fn shutdown(&self) {
