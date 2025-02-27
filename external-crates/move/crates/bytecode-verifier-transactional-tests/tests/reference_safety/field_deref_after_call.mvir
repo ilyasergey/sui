@@ -1,0 +1,27 @@
+//# publish
+module 0x239.Tester {
+    struct T {
+        f: u64,
+        g: u64,
+    }
+
+    struct X has key { f: u64 }
+
+    id(x: &mut Self.T): &mut Self.T {
+    label l0:
+      return move(x);
+    }
+
+    imprecise(t: &mut Self.T) {
+        let x: &mut Self.T;
+        let f: &mut u64;
+        let g: &mut u64;
+    label l0:
+        x = Self.id(move(t));
+        f = &mut copy(x).T::f;
+        g = &mut copy(x).T::g;
+        *copy(g) = 10;
+        return;
+    }
+
+}
